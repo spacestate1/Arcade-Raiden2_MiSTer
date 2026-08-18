@@ -1924,7 +1924,7 @@ screen_rotate screen_rotate
 
     .rotate_ccw(rotate_ccw),
     .no_rotate(eff_no_rotate),
-    .flip(1'b0),
+    .flip(dsw_bytes[0][7]),
     .video_rotated(video_rotated),
 
     .FB_EN(FB_EN), .FB_FORMAT(FB_FORMAT),
