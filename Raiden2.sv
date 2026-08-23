@@ -304,6 +304,8 @@ wire       video_rotated;
 // fetch, decrypted ROM -- but with nothing else drawn, so "sprites missing"
 // and "sprites hidden behind a tilemap" cannot be confused for each other.
 wire [1:0] test_mode      = status[7:6];
+// 60 Hz OSD option -- see the CONF_STR note and raiden2_video_timing.
+wire       rate_60        = status[8];
 // Index 0 is OFF (play the game); the diagnostics follow. Keep this in step
 // with the CONF_STR "Self test" line above -- they are positional.
 wire       show_checks    = (test_mode == 2'd1);
@@ -332,6 +334,11 @@ localparam CONF_STR = {
     // second menu item over bits another one already claims.
     "O[3:2],Rotate,CCW (TATE),CW,None;",
     "O[5:4],Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%;",
+    // Native timing is 282 lines -> 55.42 Hz, which some 15 kHz CRTs will not
+    // hold (github issue #1). 60Hz trims vertical blanking to 260 lines
+    // (60.10 Hz, H rate unchanged); the vblank IRQ then comes 8.4% sooner and
+    // the game runs that much faster -- accuracy traded for a stable picture.
+    "O[8],Refresh Rate,55.4Hz Native,60Hz;",
     // "Off" MUST stay first. MiSTer's status word powers up at 0, so index 0
     // is what a user gets on a fresh core load -- and with "Checks" first the
     // core booted into the diagnostic page instead of the game.
@@ -482,10 +489,11 @@ wire signed [15:0] snd_audio;
 // Declared here rather than with the rest of the SDRAM plumbing because the
 // core reset below depends on bist_busy, and a forward reference would be
 // implicitly declared as a 1-bit net and then clash with the real declaration.
-wire [24:0] bist_ch3_addr, bist_ch1_addr;
-wire        bist_ch3_req,  bist_ch1_req;
+wire [24:0] bist_ch3_addr, bist_ch1_addr, bist_ch2_addr, bist_ch4_addr;
+wire        bist_ch3_req,  bist_ch1_req,  bist_ch2_req,  bist_ch4_req;
 wire        bist_dl_complete, bist_busy, bist_done, bist_pass;
-wire        bist_bad_valid, bist_bad_is_ch1;
+wire        bist_bad_valid;
+wire  [2:0] bist_bad_ch;
 wire [23:0] bist_bad_addr;
 
 // Two resets. The video timing must keep running while the SDRAM self test
@@ -623,10 +631,12 @@ reg  [24:0] sdr_rom_addr;
 reg  [15:0] sdr_rom_din;
 reg         sdr_rom_req;
 
-// The self-test sweeps both read channels once the download is done, and owns
-// them exclusively: the core is held in reset for the duration, so sdr_cpu_req
-// and sdr_gfx_req are both parked low by their own reset branches. Its wires
-// are declared up with the reset logic, which depends on bist_busy.
+// The self-test sweeps all four read channels once the download is done, and
+// owns them exclusively: the core is held in reset for the duration, so
+// sdr_cpu_req, sdr_gfx_req and sdr_oki_req are parked low by their own reset
+// branches, and the sprite fetch FSM is gated on ~bist_busy (sei252 only
+// resets on sys_reset). Its wires are declared up with the reset logic, which
+// depends on bist_busy.
 //
 // Muxing sdr_ch3_req is only safe because all three sides are one-clock pulses
 // that idle low: with toggle-encoded requests the mux would step from one level
@@ -646,6 +656,17 @@ assign      sdr_cpu_rdy  = sdr_ch3_rdy;
 wire [24:0] sdr_ch1_addr_mux = bist_busy ? bist_ch1_addr : sdr_gfx_addr;
 wire        sdr_ch1_req_mux  = bist_busy ? bist_ch1_req  : sdr_gfx_req;
 
+// And the two 64-bit ports. The OKI side is in reset (jt6295 and the cache
+// both sit on `reset`, which includes bist_busy) so it is parked low; the
+// sprite renderer only resets on sys_reset -- it keeps rastering the self-test
+// backdrop -- so its fetch FSM below is explicitly gated on ~bist_busy, and
+// the BIST orders the ch2 sweep after two full-image sweeps so anything in
+// flight at the handover has long since drained.
+wire [24:0] sdr_ch2_addr_mux = bist_busy ? bist_ch2_addr : sdr_spr_addr;
+wire        sdr_ch2_req_mux  = bist_busy ? bist_ch2_req  : sdr_spr_req;
+wire [24:0] sdr_ch4_addr_mux = bist_busy ? bist_ch4_addr : sdr_oki_addr;
+wire        sdr_ch4_req_mux  = bist_busy ? bist_ch4_req  : sdr_oki_req;
+
 // ---- Crossing clk_sys -> clk_ram --------------------------------------
 // The mirror of the ready stretch above. A one-clk_sys request pulse is 15.6 ns
 // and would in fact always be sampled by a 10.4 ns clk_ram period -- but the
@@ -662,13 +683,13 @@ reg  sdr_ch3_req_d, sdr_ch1_req_d, sdr_ch2_req_d, sdr_ch4_req_d;
 always @(posedge clk_sys) begin
     sdr_ch3_req_d <= sdr_ch3_req;
     sdr_ch1_req_d <= sdr_ch1_req_mux;
-    sdr_ch2_req_d <= sdr_spr_req;
-    sdr_ch4_req_d <= sdr_oki_req;
+    sdr_ch2_req_d <= sdr_ch2_req_mux;
+    sdr_ch4_req_d <= sdr_ch4_req_mux;
 end
 wire sdr_ch3_req_wide = sdr_ch3_req    | sdr_ch3_req_d;
 wire sdr_ch1_req_wide = sdr_ch1_req_mux | sdr_ch1_req_d;
-wire sdr_ch2_req_wide = sdr_spr_req     | sdr_ch2_req_d;
-wire sdr_ch4_req_wide = sdr_oki_req     | sdr_ch4_req_d;
+wire sdr_ch2_req_wide = sdr_ch2_req_mux | sdr_ch2_req_d;
+wire sdr_ch4_req_wide = sdr_ch4_req_mux | sdr_ch4_req_d;
 
 sdram sdram
 (
@@ -685,7 +706,7 @@ sdram sdram
     .ch1_addr(sdr_ch1_addr_mux[24:1]), .ch1_dout(sdr_gfx_dout),
     .ch1_req(sdr_ch1_req_wide), .ch1_ready(sdr_gfx_rdy),
 
-    .ch2_addr(sdr_spr_addr[24:1]), .ch2_dout(sdr_spr_dout),
+    .ch2_addr(sdr_ch2_addr_mux[24:1]), .ch2_dout(sdr_spr_dout),
     .ch2_req(sdr_ch2_req_wide), .ch2_ready(sdr_spr_rdy),
 
     .ch3_addr(sdr_ch3_addr[24:1]), .ch3_din(sdr_ch3_din), .ch3_dout(sdr_cpu_dout),
@@ -696,7 +717,7 @@ sdram sdram
     // at the clk_sys<->clk_ram crossing (see the single-flop notes here and in
     // sdram.sv), not arbitration -- ch4 is lowest priority and merely refit
     // the design onto less lucky routing.
-    .ch4_addr(sdr_oki_addr[24:1]), .ch4_dout(sdr_oki_dout),
+    .ch4_addr(sdr_ch4_addr_mux[24:1]), .ch4_dout(sdr_oki_dout),
     .ch4_req(sdr_ch4_req_wide), .ch4_ready(sdr_oki_rdy)
 );
 
@@ -938,9 +959,17 @@ raiden2_sdram_bist bist
     .ch1_addr(bist_ch1_addr), .ch1_req(bist_ch1_req),
     .ch1_dout(sdr_gfx_dout), .ch1_rdy(sdr_gfx_ack),
 
+    // The sprite and OKI return paths, raw for the same reason. Their acks are
+    // the same edge detects the fetch logic uses; while the BIST owns the bus
+    // the core is in reset, so nothing else consumes them.
+    .ch2_addr(bist_ch2_addr), .ch2_req(bist_ch2_req),
+    .ch2_dout(sdr_spr_dout), .ch2_rdy(sdr_spr_ack),
+    .ch4_addr(bist_ch4_addr), .ch4_req(bist_ch4_req),
+    .ch4_dout(sdr_oki_dout), .ch4_rdy(sdr_oki_ack),
+
     .dl_complete(bist_dl_complete),
     .busy(bist_busy), .done(bist_done), .pass(bist_pass),
-    .bad_valid(bist_bad_valid), .bad_is_ch1(bist_bad_is_ch1),
+    .bad_valid(bist_bad_valid), .bad_ch(bist_bad_ch),
     .bad_addr(bist_bad_addr)
 );
 
@@ -1068,7 +1097,7 @@ wire [8:0]  next_line;
 // and the SDRAM sweep so the self-test page is visible while they happen.
 raiden2_video_timing timing
 (
-    .clk(clk_sys), .reset(sys_reset),
+    .clk(clk_sys), .reset(sys_reset), .rate_60(rate_60),
     .ce_pix(ce_pix), .hcnt(hcnt), .vcnt(vcnt),
     .hsync(hsync), .vsync(vsync), .hblank(hblank), .vblank(vblank),
     .vblank_rise(vblank_rise),
@@ -1494,10 +1523,30 @@ always @(posedge clk_sys) begin
     end
 end
 
+// ---- In-core 180-degree flip (the Flip Screen dip) --------------------
+// The real board's video chips flip the raster themselves when the dip is
+// on; doing it at the framework's screen_rotate instead (the first attempt,
+// from PR #3) only flips the DDR3 framebuffer the SCALER displays -- HDMI
+// flipped, direct analog VGA did not, and a rotated-CRT cab is exactly who
+// needs this dip. Flipping here -- source line mirrored into the line fills,
+// X mirrored at the line-buffer readout -- flips the core's own raster, so
+// every output follows, analog included, with no framebuffer involved.
+//
+// The dip is active low (FF default = Off). Gated off for the raster-order
+// self-test pages, which are diagnostics, not game video; "Sprites only"
+// (show_spronly) is game video and flips with the rest.
+wire       flip_active = ~dsw_bytes[0][7] & ~selftest_show;
+// Only visible lines mirror; vblank-row fills stay where they were.
+wire [8:0] fill_line   = (flip_active && next_line < 9'd240)
+                       ? (9'd239 - next_line) : next_line;
+// Garbage reads while hcnt is in blanking are masked downstream, exactly as
+// the unflipped readout's were.
+wire [8:0] lb_x        = flip_active ? (9'd319 - hcnt[8:0]) : hcnt[8:0];
+
 sei0200 tilemaps
 (
     .clk(clk_sys), .reset(reset),
-    .line(next_line), .start(line_start), .busy(tm_busy),
+    .line(fill_line), .start(line_start), .busy(tm_busy),
 
     .bg_scroll_x(bg_sx_l),   .bg_scroll_y(bg_sy_l),
     .mid_scroll_x(mid_sx_l), .mid_scroll_y(mid_sy_l),
@@ -1510,7 +1559,7 @@ sei0200 tilemaps
     .rom_addr(gfx_addr), .rom_is_char(gfx_is_char), .rom_req(gfx_req),
     .rom_data(gfx_data), .rom_valid(gfx_valid),
 
-    .fill_bank(fill_bank), .lb_rd_bank(~fill_bank), .lb_rd_x(hcnt[8:0]),
+    .fill_bank(fill_bank), .lb_rd_bank(~fill_bank), .lb_rd_x(lb_x),
     .lb_bg(lb_bg), .lb_mid(lb_mid), .lb_fg(lb_fg), .lb_txt(lb_txt)
 );
 
@@ -1773,8 +1822,9 @@ raiden2_selftest selftest
     .hcnt(hcnt), .vcnt(vcnt), .next_line(next_line),
     .chk_state(chk_state),
     .scroll(page_scroll),
-    .bad_valid(bist_bad_valid), .bad_is_ch1(bist_bad_is_ch1),
+    .bad_valid(bist_bad_valid), .bad_ch(bist_bad_ch),
     .bad_addr(bist_bad_addr),
+    .game_dx(game_dx),
     .mode_valid(dbg_unknown_valid), .bad_mode({3'd0, dbg_unknown_mode}),
     .build_stamp(`BUILD_STAMP),
     .cpu_addr(cpu_pc_latched),
@@ -1828,7 +1878,13 @@ always @(posedge clk_sys) begin
     if (sys_reset) begin
         sdr_spr_busy <= 1'b0;
     end else if (!sdr_spr_busy) begin
-        if (st_rom_req & ~show_sprtest) begin
+        // ~bist_busy: sei252 keeps rastering through the SDRAM sweep (it only
+        // resets on sys_reset, so the self-test backdrop stays alive), and on a
+        // warm reload its latched sprite RAM still holds the previous game's
+        // list -- without this gate those stale fetches would interleave with
+        // the BIST's own ch2 reads and corrupt the sweep. A gated-off fill
+        // shows one stale sprite line while the core is in reset anyway.
+        if (st_rom_req & ~show_sprtest & ~bist_busy) begin
             sdr_spr_addr_r <= SDR_SPRITES + {2'd0, st_rom_addr};
             sdr_spr_req    <= 1'b1;
             sdr_spr_busy   <= 1'b1;
@@ -1851,12 +1907,15 @@ wire        rom_src_valid = show_sprtest ? st_rom_valid : sdr_spr_valid;
 sei252 sprites
 (
     .clk(clk_sys), .reset(sys_reset),
-    .line(next_line), .start(line_start), .busy(spr_busy),
+    // fill_line / lb_x: the in-core flip (see the tilemap instance above).
+    // In sprite-test mode flip_active is forced off, so the test page is
+    // bit-identical whatever the dip says.
+    .line(fill_line), .start(line_start), .busy(spr_busy),
     .spr_addr(st_spr_addr), .spr_data(spr_src_data),
     .rom_addr(st_rom_addr), .rom_req(st_rom_req),
     .rom_data(rom_src_data), .rom_valid(rom_src_valid),
     .fill_bank(st_fill_bank), .lb_rd_bank(~st_fill_bank),
-    .lb_rd_x(hcnt[8:0]), .lb_out(st_lb)
+    .lb_rd_x(lb_x), .lb_out(st_lb)
 );
 
 // Fixed palette so the test does not depend on CRAM having been filled.
@@ -1924,6 +1983,14 @@ screen_rotate screen_rotate
 
     .rotate_ccw(rotate_ccw),
     .no_rotate(eff_no_rotate),
+    // Deliberately NOT the Flip Screen dip. The flip here writes the DDR3
+    // framebuffer the SCALER displays, so only HDMI flips -- verified on
+    // hardware 2026-08-22: HDMI flipped, direct analog VGA did not, and a
+    // rotated-CRT cab is exactly who needs the dip. The dip instead flips
+    // the core's own raster (flip_active, at the line-fill/readout muxes by
+    // the sei0200 instance), which every output follows; wiring it here as
+    // well would double-flip HDMI back to normal. (First attempt was PR #3's
+    // approach with the active-low polarity corrected -- kept in history.)
     .flip(1'b0),
     .video_rotated(video_rotated),
 

@@ -51,6 +51,17 @@ module raiden2_video_timing #(
     input  logic       clk,
     input  logic       reset,
 
+    // OSD "Refresh Rate" option. The pixel clock and the 512-pixel line are
+    // untouched (H stays 15.625 kHz); only the vertical total shrinks,
+    // 282 -> 260 lines, giving 8e6/(512*260) = 60.10 Hz for CRTs that will
+    // not hold 55.4 Hz. Both render engines fill line buffers within each
+    // line, so fewer blanking lines change nothing they depend on -- but the
+    // vblank IRQ comes 8.4% sooner, so the GAME RUNS THAT MUCH FASTER. This
+    // is the same trade every 60 Hz core option makes; it is labelled, not
+    // hidden. The 17 blanking lines split 8/3/9 around the sync pulse, the
+    // same centring rule as the native values above.
+    input  logic       rate_60,
+
     output logic       ce_pix,
     output logic [9:0] hcnt,
     output logic [8:0] vcnt,
@@ -64,6 +75,12 @@ module raiden2_video_timing #(
     output logic       line_start,    // pulse: begin filling next_line
     output logic [8:0] next_line
 );
+
+    // Runtime-selected vertical totals. H never changes, so H_TOTAL et al stay
+    // parameters; these three are the only values the 60 Hz option touches.
+    wire [8:0] v_total  = rate_60 ? 9'd260 : V_TOTAL[8:0];
+    wire [8:0] vs_start = rate_60 ? 9'd248 : VS_START[8:0];
+    wire [8:0] vs_end   = rate_60 ? 9'd251 : VS_END[8:0];
 
     logic [3:0] divcnt;
 
@@ -83,8 +100,11 @@ module raiden2_video_timing #(
 
                 if (hcnt == H_TOTAL[9:0] - 10'd1) begin
                     hcnt <= 10'd0;
-                    if (vcnt == V_TOTAL[8:0] - 9'd1) vcnt <= 9'd0;
-                    else                             vcnt <= vcnt + 9'd1;
+                    // >= rather than ==: switching 282 -> 260 mid-frame can
+                    // leave vcnt above the new total, and an == would then
+                    // only wrap after the 9-bit counter ran to 511.
+                    if (vcnt >= v_total - 9'd1) vcnt <= 9'd0;
+                    else                        vcnt <= vcnt + 9'd1;
 
                     // Start of a new line: queue the fill for the line after it.
                     line_start <= 1'b1;
@@ -100,11 +120,11 @@ module raiden2_video_timing #(
     end
 
     // next_line wraps so the last visible line's fill doesn't run off the end.
-    assign next_line = (vcnt == V_TOTAL[8:0] - 9'd1) ? 9'd0 : vcnt + 9'd1;
+    assign next_line = (vcnt >= v_total - 9'd1) ? 9'd0 : vcnt + 9'd1;
 
     assign hblank = (hcnt >= H_VIS[9:0]);
     assign vblank = (vcnt >= V_VIS[8:0]);
     assign hsync  = (hcnt >= HS_START[9:0]) && (hcnt < HS_END[9:0]);
-    assign vsync  = (vcnt >= VS_START[8:0]) && (vcnt < VS_END[8:0]);
+    assign vsync  = (vcnt >= vs_start) && (vcnt < vs_end);
 
 endmodule

@@ -29,7 +29,19 @@
 //   * X and Y are 9-bit and wrap into negatives at 0x180.
 //   * Raiden II registers no x/y offset and no gfxbank callback.
 //   * Transparent pen is 15.
-//   * The list is drawn BACK TO FRONT (last entry first), so entry 0 wins.
+//   * Entry 0 wins overlaps. MAME gets that by drawing BACK TO FRONT (last
+//     entry first) and letting later draws overwrite; this walks the list
+//     FRONT TO BACK with first-writer-wins instead -- identical output on any
+//     line that completes (first opaque pixel front-to-back IS the last one
+//     back-to-front), but when a line runs over budget and is truncated (see
+//     the plotter's restart note) the sprites lost are now the BACK-most,
+//     not the front-most. The game orders its list front-first -- the player,
+//     bullets, bonus items -- and real hardware's per-line limit also starves
+//     the back of the list, so a truncated line keeps the sprites that
+//     matter. Under the old order a heavy line silently dropped exactly the
+//     front sprites, which on screen read as "enemy passes BEHIND the
+//     scenery" (github issue #4's report is level 2 DX, the sprite-heaviest
+//     scene measured).
 //
 //  Output encoding matches MAME's draw_raw, which is what the SEI360 mixer
 //  consumes: {opaque, priority[1:0], colour[5:0], pen[3:0]}.
@@ -166,9 +178,13 @@ module sei252 #(
     // A line_start arriving mid-fill used to be IGNORED, so an over-budget
     // line cost the WHOLE of the next line: no fill happened at all and the
     // raster showed the previous line's pixels. Truncating the overrunning
-    // line instead loses only its tail sprites, which is both far less
-    // visible and closer to the PCB -- real hardware bounds per-line sprite
-    // work and ours deliberately does not (see the header note).
+    // line instead loses only the sprites not yet plotted, which is both far
+    // less visible and closer to the PCB -- real hardware bounds per-line
+    // sprite work and ours deliberately does not (see the header note). The
+    // list is walked front to back, so what a truncated line loses is its
+    // BACK-most sprites -- the same end of the list a real per-line limit
+    // starves -- while the front sprites (player, bullets, bonus items) have
+    // already landed.
     //
     // The abort cannot be immediate when a ROM request is in flight. The ch2
     // bridge is single-outstanding and latches at request time, so an
@@ -185,7 +201,7 @@ module sei252 #(
     } scan_t;
     scan_t sc;
 
-    logic  [8:0] idx;        // sprite entry index, walked 511 -> 0 (back to front)
+    logic  [8:0] idx;        // sprite entry index, walked 0 -> 511 (front to back)
     logic  [2:0] ax;         // current sub-tile column
     logic  [2:0] fetch_ax;   // column the OUTSTANDING request is for (may be ax+1)
 
@@ -225,6 +241,15 @@ module sei252 #(
     logic signed [10:0] col_x;
     logic  [3:0] px_i;
     logic  [8:0] clr_x;
+
+    // First-writer-wins occupancy, one bit per visible pixel of the line
+    // being filled. The front-to-back walk means the first opaque write at an
+    // x is the front-most sprite there, so later (further back) sprites must
+    // not overwrite it -- this mask is what enforces that without a
+    // read-modify-write on the line buffer BRAM. Cleared in one assignment
+    // when a new line is accepted; the 320-cycle S_CLR that follows keeps any
+    // plot hundreds of cycles away from that clear.
+    logic [SCREEN_W-1:0] drawn;
 
     assign spr_addr = {idx[8:0], word_sel};
     assign busy     = (st != S_IDLE);
@@ -306,7 +331,7 @@ module sei252 #(
             // Neither bench can catch it: both idle for hundreds of cycles
             // before restarting, while hardware fires line_start every 4096
             // clocks whatever the engine is doing.
-            idx      <= 9'd511;      // back to front
+            idx      <= 9'd0;        // front to back -- see the header note
             word_sel <= 2'd1;        // tile code first
             p_valid  <= 1'b0;
             q_valid  <= 1'b0;
@@ -321,33 +346,33 @@ module sei252 #(
                 // data lands next cycle, so idx starts running one step AHEAD
                 // of the entry being examined. From here on:
                 //
-                //     spr_data in SC_E1  ==  word1 of entry (idx + 1)
+                //     spr_data in SC_E1  ==  word1 of entry (idx - 1)
                 //
                 // That one-ahead skew is what makes an empty slot cost ONE
                 // clock instead of two: previously the loop went back through
                 // SC_E0W every slot purely to absorb the sprite RAM's 1-cycle
-                // latency. Get the +1 wrong and the scanner reads one entry's
+                // latency. Get the -1 wrong and the scanner reads one entry's
                 // tile code with another entry's attributes.
                 SC_E0W: begin
-                    idx <= idx - 9'd1;
+                    idx <= idx + 9'd1;
                     sc  <= SC_E1;
                 end
 
                 SC_E1: begin
                     if (spr_data != 16'd0) begin
-                        // Non-empty: the code belongs to idx+1, so wind idx
+                        // Non-empty: the code belongs to idx-1, so wind idx
                         // back onto that entry before reading its other words.
-                        idx      <= idx + 9'd1;
+                        idx      <= idx - 9'd1;
                         c_w1     <= spr_data;
                         word_sel <= 2'd0;
                         sc       <= SC_E1W;
-                    end else if (idx == 9'd511) begin
-                        // idx wrapped past 0, so the entry just examined WAS
-                        // entry 0 -- the list is finished.
+                    end else if (idx == 9'd0) begin
+                        // idx wrapped past 511, so the entry just examined WAS
+                        // entry 511 -- the list is finished.
                         sc <= SC_DONE;
                     end else begin
                         // Empty slot: keep the pipeline running, one per clock.
-                        idx <= idx - 9'd1;
+                        idx <= idx + 9'd1;
                     end
                 end
                 SC_E1W: sc <= SC_E2;
@@ -367,10 +392,10 @@ module sei252 #(
                 SC_E3W: begin
                     if (c_row_hit) begin
                         sc <= SC_COL0;
-                    end else if (idx == 9'd0) begin
+                    end else if (idx == 9'd511) begin
                         sc <= SC_DONE;
                     end else begin
-                        idx      <= idx - 9'd1;
+                        idx      <= idx + 9'd1;
                         word_sel <= 2'd1;
                         sc       <= SC_E0W;
                     end
@@ -395,9 +420,9 @@ module sei252 #(
                 // scanner keeps hunting while the plotter is still drawing.
                 SC_HOLD: begin
                     if (!q_valid) begin
-                        if (idx == 9'd0) sc <= SC_DONE;
+                        if (idx == 9'd511) sc <= SC_DONE;
                         else begin
-                            idx      <= idx - 9'd1;
+                            idx      <= idx + 9'd1;
                             word_sel <= 2'd1;
                             sc       <= SC_E0W;
                         end
@@ -442,6 +467,9 @@ module sei252 #(
         end
 
         line_restart <= 1'b0;
+        // The pulse was set on the transition into S_CLR; plotting is at
+        // least the 320-cycle clear away, so clearing here cannot race a set.
+        if (line_restart) drawn <= '0;
 
         if (reset) begin
             st          <= S_IDLE;
@@ -450,6 +478,7 @@ module sei252 #(
             pf_busy     <= 1'b0;
             pf_have     <= 1'b0;
             pf_for_next <= 1'b0;
+            drawn       <= '0;
         end else if (start && st != S_IDLE && rom_outstanding) begin
             // Overrun with a fetch in flight: absorb the reply, then restart.
             st <= S_DRAIN;
@@ -573,10 +602,13 @@ module sei252 #(
 
                 // ---- one pixel per clock into the line buffer ----
                 S_PLOT: begin
-                    if (pen != TRANSPEN && plot_ok) begin
+                    // drawn[] is only meaningful under plot_ok, which also
+                    // bounds the index into it.
+                    if (pen != TRANSPEN && plot_ok && !drawn[plot_x[8:0]]) begin
                         lb_wa <= {fill_bank, plot_x[8:0]};
                         lb_wd <= {1'b1, e_pri, e_colour, pen};
                         lb_we <= 1'b1;
+                        drawn[plot_x[8:0]] <= 1'b1;
                     end
 
                     // Ask for the next row needed, on the first plot cycle.

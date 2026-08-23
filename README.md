@@ -32,7 +32,7 @@ recently, so treat it as the newer of the two — see
 | SEI0200 tilemap chip (4 layers) | Working, incl. DX's swapped CRTC register layout |
 | SEI360 mixer (layer priority, transparency) | Working |
 | Sound — Z80, YM2151, two OKI6295 chips | Working |
-| Video timing | 320x240 at 55.4078 Hz |
+| Video timing | 320x240 at 55.4 Hz native, optional 60 Hz for CRTs |
 | SDRAM and ROM loading | Working — 14 MB (II) / 16.5 MB (DX) verified on hardware |
 
 ## Known problems
@@ -279,6 +279,22 @@ The left analog stick works alongside the d-pad without any setup, and the
 keyboard layout is the usual arcade one, so muscle memory from MAME carries
 over. All gamepad buttons can be remapped in the MiSTer menu.
 
+## Video options
+
+**Refresh Rate** (OSD): the real board runs 282 lines per frame at ~55.4 Hz,
+and some 15 kHz CRTs will not hold vertical sync that far below 60. The
+**60Hz** setting trims vertical blanking to 260 lines — 60.10 Hz, with the
+horizontal rate unchanged at 15.625 kHz, so the picture geometry does not
+move. The trade is honest and unavoidable: the game paces itself off the
+vblank interrupt, so in this mode it plays about 8% faster than the arcade.
+Music tempo is set by the YM2151's own timer and does not speed up. Leave it
+on **55.4Hz Native** unless your display cannot hold the picture.
+
+**Flip Screen** (DIP switches menu): flips the picture 180°, as the real
+board's DIP does. The flip happens inside the core's own raster — the same
+place the arcade hardware does it — so it applies to **every output**:
+HDMI, direct analog VGA, rotated or not.
+
 ## The arcade board's own service menu
 
 Separate from the core's self test below, and useful for anyone comparing
@@ -317,17 +333,16 @@ misread this test:
 A check that has passed stays passed, so the honest reading is the page after
 it has been up for a minute or two, not the one that appears first.
 
-**What `SDRAM VERIFY` does and does not cover.** It checksums every word as it
-is downloaded, then reads the whole image back and compares — so the data at
-rest is proven good across all 14 MB. But it reads it back through only two of
-the four SDRAM channels: ch1 (tiles) and ch3 (CPU). The sprite path (ch2) and
-the OKI sample path (ch4) are never data-verified — `SPRITE FETCH CH2` and
-`OKI ROM FETCH` only count that fetches happened, and `SPRITE DECRYPT`
-checksums the *inbound download stream*, not anything read back from SDRAM.
-
-So a fault confined to the ch2 or ch4 return path would pass all 22 checks.
-For ch4 that would mean wrong or noisy sound effects over a fully green page,
-with nothing in the core to catch it.
+**What `SDRAM VERIFY` covers.** It checksums every word as it is downloaded
+(sprites post-decryption, i.e. exactly what lands in memory), then reads the
+whole image back through **each of the four SDRAM channels** — ch3 (CPU),
+ch1 (tiles), ch2 (sprites), ch4 (OKI) — and compares per 64 KB block. A
+mismatch names the channel and the block base address on the detail line, so
+a fault confined to one port's return path points at that port instead of
+passing unnoticed. (Earlier releases swept only ch1 and ch3; a ch2/ch4-only
+fault — wrong sprites or noisy sound over a fully green page — was invisible
+to the check. The two extra sweeps add roughly a second to the post-load
+check.)
 
 This exists because a black screen tells you nothing about *why* it is black.
 The self test has found several real faults that simulation missed.

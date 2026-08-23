@@ -40,8 +40,12 @@ module raiden2_selftest #(
 
     // Shown on the detail line only when the SDRAM check has failed.
     input  logic        bad_valid,
-    input  logic        bad_is_ch1,  // 0 = ch3 (CPU port), 1 = ch1 (gfx port)
+    input  logic  [2:0] bad_ch,      // SDRAM channel number (1..4) that failed
     input  logic [23:0] bad_addr,
+
+    // Overrides the title row's "II" with "DX" when Raiden DX is loaded --
+    // the page ROM itself is generated and stays untouched.
+    input  logic        game_dx,
 
     // The first COP DMA mode the engine rejected. Naming it turns "COP MODES
     // KNOWN failed" from a dead end into a work item.
@@ -150,6 +154,12 @@ module raiden2_selftest #(
 
     wire        is_detail_row = (frow == DETAIL_ROW);
     wire        is_port  = is_detail_row && (fcol == DETAIL_PORT_COL);
+
+    // The title row's "II" sits at cols 10-11 (page ROM cells 74/75). When DX
+    // is loaded those two fetches become 'D' and 'X'. frow includes the page
+    // scroll, so a scrolled-off title never triggers these.
+    wire        is_dx_d  = game_dx && (frow == TITLE_ROW) && (fcol == 7'd10);
+    wire        is_dx_x  = game_dx && (frow == TITLE_ROW) && (fcol == 7'd11);
     wire        is_hex   = is_detail_row && (fcol >= DETAIL_HEX_COL) && (fcol < DETAIL_HEX_COL + 7'd6);
     wire  [2:0] hex_pos  = fcol[2:0] - DETAIL_HEX_COL[2:0];
 
@@ -219,15 +229,17 @@ module raiden2_selftest #(
     always_ff @(posedge clk) begin
         sub_d <= fsub;
 
-        dyn_sel <= is_result | is_count | is_port | is_hex | is_mode_hex | is_build_hex | is_pc_hex;
+        dyn_sel <= is_result | is_count | is_port | is_hex | is_mode_hex | is_build_hex | is_pc_hex | is_dx_d | is_dx_x;
         // The whole detail line stays blank until the SDRAM check has actually
         // failed, so a healthy board does not show a stray "CH0 @ 0x000000".
         // Each detail line is blanked entirely unless it has something to say.
         blank_cell <= (is_detail_row & ~bad_valid) | (is_mode_row & ~mode_valid);
 
-        if (is_result)     dyn_ch <= result_char(chk_st, result_pos);
+        if (is_dx_d)       dyn_ch <= 6'd36;   // 'D'
+        else if (is_dx_x)  dyn_ch <= 6'd56;   // 'X'
+        else if (is_result) dyn_ch <= result_char(chk_st, result_pos);
         else if (is_count) dyn_ch <= C_ZERO + {2'd0, (count_lo ? count_ones : count_tens)};
-        else if (is_port)     dyn_ch <= C_ZERO + (bad_is_ch1 ? 6'd1 : 6'd3);
+        else if (is_port)     dyn_ch <= C_ZERO + {3'd0, bad_ch};
         else if (is_mode_hex) dyn_ch <= hex_char(mode_nib);
         else if (is_build_hex)dyn_ch <= hex_char(build_nib);
         else if (is_pc_hex)   dyn_ch <= hex_char(pc_nib);
