@@ -3,4 +3,4 @@
 # Verify with either:
 #     tools/check_files.py
 #     md5sum -c md5sums.txt      (run from releases/)
-55a5b22a84c0594c86542aba14366d7d  Raiden2_20260811.rbf
+84ff2287b868ef524d6c37a49a8b1a14  Raiden2_20260822.rbf
